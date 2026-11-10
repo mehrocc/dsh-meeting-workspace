@@ -1,0 +1,22 @@
+{
+  "LICENSE-ONNX-Runtime": "2f07c72751aed99790b8a4869cf2311df85a860b22ded05fa22803587a48922c",
+  "LICENSE-X-ASR": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "LICENSE-sherpa-onnx": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+  "ONNX-Runtime-ThirdPartyNotices.txt": "1624b71afb8ec44bd85fd7a8c0e84d4ac0d74de3b56aa6b04005443e1cf4a300",
+  "ORIGINS.md": "a58b81871b925c732bc3b9bd132084af67f29dd571eb9eeecb54e9c89f2fac93",
+  "model/bpe.model": "f87a38025a5fdd1e4e9591f6a44bb81295097ce0b80df6f4ab9f44e52c64ca5f",
+  "model/decoder.onnx": "a1cbc9eac2d5e3fb6617a218c67ad6daaa7f4e0fd225f08b2c22ab0413c8c257",
+  "model/encoder.int8.onnx": "908596dcc137a73b95be908ca55e88caa1b3dbbe8027c171615f4b0609c5eb1e",
+  "model/joiner.int8.onnx": "aedb7fa697b2ab43f20499826fff7c997eea7d67db77be97769aeeeb726e63b3",
+  "model/tokens.txt": "b818a60878b9aae978cbb8ad594acbd403d76d1af2e31ef4197c84e2dbdba27c",
+  "native/libonnxruntime.dylib": "b0613d0ae53199a83b05fa48e169211498e9d40d54beaa372068ebe5ec5b0929",
+  "native/libsherpa-onnx-c-api.dylib": "08874710fd7e215a0d6724d43f05626e59807642b63db7766fe7577737592b2c",
+  "native/libsherpa-onnx-cxx-api.dylib": "56f570cabd46a9d3c70c01e406855d629fc806fa6e54102a6590da8bc3488a46",
+  "native/sherpa-onnx.node": "790d0e0e0654485c06ffb6ff812af880dd4d6d35425d5da90b7932969a47619b",
+  "speaker/LICENSE-3D-Speaker": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+  "speaker/LICENSE-pyannote": "14d7016ad68e7394d6e6b78d96cc2ae431c905287b89674cfdf021e79e62b8ba",
+  "speaker/embedding.onnx": "aa3cfc16963a10586a9393f5035d6d6b57e98d358b347f80c2a30bf4f00ceba2",
+  "speaker/segmentation.onnx": "d582f4b4c6b48205de7e0643c57df0df5615a3c176189be3fc461e9d18827b5d",
+  "speaker-worker.cjs": "9d7f28d2527ceaa7da14d13f10a7126d4aa3ffad575d3d7d7f1b2935f19b0c93",
+  "worker.cjs": "62ca5963fd468b579691554b3e33b308578660bf953f9f6a6af3da5687849b8d"
+}

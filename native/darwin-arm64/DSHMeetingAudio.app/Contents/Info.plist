@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>io.dsh.meeting-workspace.audio</string>
+<key>CFBundleName</key><string>DSH 会议音频</string>
+<key>CFBundleDisplayName</key><string>DSH 会议音频</string>
+<key>CFBundleIconFile</key><string>MeetingWorkspace</string>
+<key>CFBundleExecutable</key><string>DSHMeetingAudio</string>
+<key>CFBundlePackageType</key><string>APPL</string>
+<key>CFBundleShortVersionString</key><string>0.16.0</string>
+<key>CFBundleVersion</key><string>16</string>
+<key>LSMinimumSystemVersion</key><string>13.0</string>
+<key>LSUIElement</key><true/>
+<key>NSMicrophoneUsageDescription</key><string>仅在你开启线下会议提醒、点击语音输入或开始记录后使用麦克风。线下检测只在本机判断人声，不保存、不转写、不上传。</string>
+<key>NSCalendarsFullAccessUsageDescription</key><string>读取你选择的系统日历，将未来会议同步到会议准备并提醒；不修改日历。</string>
+<key>NSCalendarsUsageDescription</key><string>读取你选择的日历，展示未来会议并提醒；不修改日历。</string>
+</dict></plist>

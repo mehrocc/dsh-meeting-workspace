@@ -1,0 +1,111 @@
+import {needsSpeakerAnalysis} from '../transcript-timeline.mjs';
+import {diarizeRecording} from './speaker-diarization.mjs';
+import Schema from '@deepseek-ai/schemastery';
+import {StorageManagement} from './storage-management.mjs';
+import {MeetingStorage} from './storage.mjs';
+import {FeishuMinutes} from './feishu-minutes.mjs';
+import {HostSpeech} from './host-speech.mjs';
+import {ASRModels} from './asr-models.mjs';
+import {AssistantConversations} from './assistant-conversations.mjs';
+import {MeetingAssistant} from './meeting-assistant.mjs';
+import {HostAI} from './host-ai.mjs';
+import {SystemCalendar} from './system-calendar.mjs';
+import {MeetingDetection} from './meeting-detection.mjs';
+import {MeetingReminders} from './meeting-reminders.mjs';
+import {MeetingOrganizer} from './meeting-organizer.mjs';
+import {NativeCaptureManager} from './native-capture.mjs';
+import {fileURLToPath} from 'node:url';
+import {speechRuntimeDirectory} from '../speech-runtime-location.mjs';
+import {checkedTranscript} from './transcript-quality.mjs';
+export const name='meeting-workspace-local';
+export const inject=['connection'];
+export const Config=Schema.object({root:Schema.string().required()});
+import {applySummary} from '../model.mjs';
+const PREFIX='/api/meeting-workspace';
+const MAX=25*1024*1024;
+export function apply(ctx,config,runtime={}){
+ const get=name=>runtime.services?.[name]??ctx.get?.(name);
+ const speech=new HostSpeech(get),ai=new HostAI(get,config.root);
+ const storage=new MeetingStorage(config.root);
+ const minutes=new FeishuMinutes(runtime.minutesExecute);
+ let assistant=null;
+ const conversations=new AssistantConversations({get,storage,assistant:()=>assistant});
+ const mountAssistant=scope=>{const tools=runtime.services?.tools||scope.tools,systemPrompt=runtime.services?.systemPrompt||scope.systemPrompt,ownership=runtime.services?.desktopWorkbenchOwnership||scope.desktopWorkbenchOwnership;const instance=new MeetingAssistant({storage,tools,systemPrompt,ownership});instance.retryReadOnly=id=>conversations.readOnlyRetries.has(id);const dispose=instance.register();assistant=instance;scope.effect?.(()=>()=>{dispose();if(assistant===instance)assistant=null})};
+ if(ctx.inject)ctx.inject(['tools','systemPrompt','desktopWorkbenchOwnership'],mountAssistant);
+ else if(runtime.services?.tools&&runtime.services?.systemPrompt&&runtime.services?.desktopWorkbenchOwnership)mountAssistant(ctx);
+
+ let capture;const organizer=new MeetingOrganizer({storage,ai,onPreview:(id,value)=>capture?.updatePreview(id,value)});
+ const streamDirectory=runtime.streamDirectory??speechRuntimeDirectory(config.root);
+ const models=new ASRModels({root:config.root,storage,speech,directory:streamDirectory,nativeAvailable:()=>capture.available(),createStream:runtime.createStream});
+ const speakerJobs=new Set();
+ const startSpeakerJob=({meetingId,captureId,location})=>{
+  if(speakerJobs.has(meetingId))throw Error('这场会议正在区分发言人');
+  speakerJobs.add(meetingId);
+  return diarizeRecording({meetingId,captureId,location,root:streamDirectory,storage,signal:organizer.controller.signal})
+   .finally(()=>speakerJobs.delete(meetingId));
+ };
+ capture=new NativeCaptureManager({storage,speech,ai,models,streamDirectory,onSaved:(id,session)=>organizer.afterCapture(id,async()=>{if(session){await session.backfill().catch(()=>{});await startSpeakerJob({meetingId:id,captureId:session.id,location:await storage.root()})}}),onProgress:id=>organizer.preview(id),binary:runtime.captureBinary||fileURLToPath(new URL('../native/darwin-arm64/DSHMeetingAudio.app/Contents/MacOS/DSHMeetingAudio',import.meta.url))});
+ const storageManagement=new StorageManagement(storage,{blocked:()=>[...(capture.starting?['*']:[]),...capture.active().map(s=>s.meetingId),...speakerJobs]});
+ const reminders=new MeetingReminders({storage,capture,speech});const calendar=new SystemCalendar({storage,capture});
+ const detection=new MeetingDetection({storage,capture,speech,promptBusy:()=>reminders.pending.size>0,...runtime.detection});
+ capture.beforeStart=()=>detection.pauseForRecording();
+ ctx.effect?.(()=>{const detector=setInterval(()=>detection.tick().catch(()=>{}),5000);detector.unref?.();const timer=setInterval(()=>{reminders.tick().catch(()=>{});calendar.tick().catch(()=>{});if(!capture.starting&&!capture.active().length)organizer.resumePending().catch(()=>{})},15000);timer.unref?.();return()=>{clearInterval(timer);clearInterval(detector);detection.dispose();reminders.dispose();calendar.dispose();minutes.dispose();organizer.dispose();return capture.dispose()}});
+ const capabilities=async()=>{const localSpeech=speech.status(),model=ai.status();return {assistantAvailable:!!assistant,browserMicrophone:true,nativeStreaming:capture.streamingReady(),systemAudio:await capture.available(),transcription:await models.snapshot(),asrConfigured:localSpeech.ready,asrSource:'dsh',asrModel:localSpeech.model,localSpeech,aiConfigured:model.configured,aiModel:model.model}};
+ const respondState=async state=>{await detection.loadConsent();return Response.json({...state,nativeCaptures:capture.active(),speakerJobs:[...speakerJobs],meetingDetection:detection.snapshot(state.data),capabilities:await capabilities(),serviceVersion:'0.16.18'})};
+ const route=(path,methods,handler)=>ctx.connection.fetch.register({path:PREFIX+path,methods,requestBody:'buffered',async fetch(request){try{const response=await handler(request);response.headers.set('Cache-Control','no-store');return response}catch(e){return Response.json({error:e.message||'会议服务出错'},{status:e.status||400,headers:{'Cache-Control':'no-store'}})}}});
+ const body=async req=>{const raw=await req.arrayBuffer();if(raw.byteLength>MAX)throw Error('文件或数据超过 25 MB 上限');return new Uint8Array(raw)};
+ route('/state',['GET','POST'],async req=>{if(req.method==='GET'){await capture.restore();return respondState(await storage.read())};const payload=JSON.parse(new TextDecoder().decode(await body(req)));const activeSessions=capture.active();if(activeSessions.length){const present=await storage.read();if(present.revision!==payload.revision){const error=Error('资料正在更新，请重试保存');error.status=409;throw error}for(const active of activeSessions){const before=present.data.meetings.find(m=>m.id===active.meetingId),after=payload.data?.meetings?.find(m=>m.id===active.meetingId);if(!after||after.captureId!==before?.captureId||JSON.stringify(after.transcript)!==JSON.stringify(before?.transcript))throw Error('请先结束双路录音，再删除会议、修改逐字稿或恢复备份')}}const saved=await storage.write(payload.data,payload.revision);reminders.reconcile(saved.data);return respondState(saved)});
+ route('/location',['POST'],async req=>{if(capture.starting||capture.active().length)throw Error('请先结束并保存双路录音，再更换资料目录');return respondState(await storage.choose((await req.json()).path))});
+ route('/audio',['GET','POST'],async req=>{const q=new URL(req.url).searchParams;if(req.method==='POST')return Response.json(await storage.audioSave(q.get('meeting'),await body(req),req.headers.get('content-type')||'application/octet-stream',q.get('name')||'会议录音'));const audio=await storage.audioRead(q.get('id'));return new Response(audio.bytes,{headers:{'Content-Type':audio.mime,'Cache-Control':'no-store'}})});
+ route('/minutes/preview',['POST'],async req=>{
+  const {link}=await req.json();
+  return Response.json(await minutes.preview(link,req.signal));
+ });
+ route('/minutes/authorization',['GET','POST'],async req=>Response.json(req.method==='POST'?await minutes.authorize():minutes.authorizationStatus()));
+ route('/detection',['GET','POST'],async req=>Response.json(req.method==='GET'?await detection.status():await detection.configure(await req.json())));
+ route('/detection/check',['POST'],async()=>{await detection.tick();return Response.json(await detection.status())});
+ route('/detection/start',['POST'],async req=>{const {id,confirmed}=await req.json();return Response.json(await detection.start(id,confirmed))});
+ route('/storage',['GET'],async()=>Response.json(await storageManagement.status()));
+ route('/storage/policy',['POST'],async req=>Response.json(await storageManagement.setPolicy((await req.json()).retentionDays)));
+ route('/storage/keep',['POST'],async req=>{const {meetingId,keep}=await req.json();return Response.json(await storageManagement.keep(meetingId,keep))});
+ route('/storage/preview',['POST'],async req=>Response.json(await storageManagement.preview((await req.json()).ids)));
+ route('/storage/cleanup',['POST'],async req=>{const {token,confirmed}=await req.json();return Response.json(await storageManagement.cleanup(token,confirmed))});
+ route('/speech',['GET','POST'],async req=>Response.json(req.method==='GET'?speech.status():await speech.prepare()));
+ route('/asr/models',['GET','POST'],async req=>{
+  if(req.method==='GET')return Response.json(await models.snapshot());
+  const {action,id}=await req.json();
+  if(action==='select')return Response.json(await models.select(id));
+  if(action==='prepare'){
+   if(capture.starting||capture.active().length)throw Error('请先结束录音，再准备模型');
+   return Response.json(await models.prepare(id));
+  }
+  throw Error('语音模型操作无效');
+ });
+ route('/capture',['GET','POST'],async req=>Response.json(req.method==='GET'?{available:await capture.available(),active:capture.active()}:await capture.start(await req.json())));
+ route('/speakers/auto',['POST'],async req=>{
+  const {meetingId}=await req.json();
+  if(capture.starting||capture.active().length||organizer.preparing.has(meetingId)||speakerJobs.size)return Response.json({started:false});
+  const state=await storage.read();
+  const meeting=state.data.meetings.find(m=>m.id===meetingId);
+  if(!needsSpeakerAnalysis(meeting)||speakerJobs.size)return Response.json({started:false});
+  startSpeakerJob({meetingId,captureId:meeting.captureId,location:state.location}).catch(()=>{});
+  return Response.json({started:true});
+ });
+ route('/capture/permissions',['GET'],async()=>Response.json(await capture.permissions()));
+ route('/capture/events',['GET'],async req=>{const q=new URL(req.url).searchParams;return Response.json(capture.get(q.get('id')).snapshot(Number(q.get('after')||0)))});
+ route('/capture/control',['POST'],async req=>{const {id,action}=await req.json();return Response.json(await capture.get(id).control(action))});
+ route('/transcribe',['POST'],async req=>{const result=await speech.transcribe(await body(req),new URL(req.url).searchParams.get('language')||'auto',req.signal);return Response.json({text:checkedTranscript(result.text),provider:'dsh',model:'SenseVoiceSmall'})});
+ route('/calendar/connect',['POST'],async()=>Response.json(await calendar.connect()));
+ route('/calendar/sync',['POST'],async req=>Response.json(await calendar.sync(await req.json())));
+ route('/plans/start',['POST'],async req=>{const {id,confirmed}=await req.json();return Response.json(await reminders.start(id,confirmed))});
+ route('/organize',['POST'],async req=>{const {meetingId}=await req.json();await organizer.queue(meetingId);organizer.organize(meetingId).catch(()=>{});return Response.json({started:true})});
+ route('/assistant/history',['GET'],async req=>Response.json(await conversations.list(req.signal)));
+ route('/assistant/messages',['GET'],async req=>{const q=new URL(req.url).searchParams;return Response.json(await conversations.read(q.get('sessionId'),Number(q.get('limit')||100)))});
+ route('/assistant/send',['POST'],async req=>Response.json(await conversations.send(await req.json(),req.signal)));
+ route('/assistant/retry',['POST'],async req=>Response.json(await conversations.retry(await req.json(),req.signal)));
+ route('/assistant/stop',['POST'],async req=>Response.json(await conversations.stop((await req.json()).sessionId)));
+ route('/assistant/dictation',['POST'],async req=>{if(!assistant)throw Error('会议助手尚未加载');const {sessionId,token}=await req.json();await assistant.authorize({session:{id:sessionId}});return Response.json(await detection.dictation(sessionId,token))});
+ route('/assistant/sources',['GET'],async req=>{if(!assistant)throw Error('DSH 原生会话检索服务尚未加载');const sessionId=new URL(req.url).searchParams.get('sessionId');return Response.json({sources:await assistant.getSources(sessionId)})});
+ route('/title',['POST'],async req=>Response.json(await ai.generate((await req.json()).transcript,'title',req.signal)));
+ route('/summarize',['POST'],async req=>{const {transcript}=await req.json();const result=await ai.generate(transcript,'summary',req.signal);applySummary({transcript,tasks:[]},{...result,decisions:[]});return Response.json({...result,decisions:[],source:'DSH AI 生成'})});
+}
