@@ -38,20 +38,20 @@ export function apply(ctx,config,runtime={}){
  const streamDirectory=runtime.streamDirectory??speechRuntimeDirectory(config.root);
  const models=new ASRModels({root:config.root,storage,speech,directory:streamDirectory,nativeAvailable:()=>capture.available(),createStream:runtime.createStream});
  const speakerJobs=new Set();
- const startSpeakerJob=({meetingId,captureId,location})=>{
+ const startSpeakerJob=({meetingId,captureId,location,readSegments})=>{
   if(speakerJobs.has(meetingId))throw Error('这场会议正在区分发言人');
   speakerJobs.add(meetingId);
-  return diarizeRecording({meetingId,captureId,location,root:streamDirectory,storage,signal:organizer.controller.signal})
+  return diarizeRecording({meetingId,captureId,location,root:streamDirectory,storage,signal:organizer.controller.signal,...(readSegments?{readSegments}:{})})
    .finally(()=>speakerJobs.delete(meetingId));
  };
- capture=new NativeCaptureManager({storage,speech,ai,models,streamDirectory,onSaved:(id,session)=>organizer.afterCapture(id,async()=>{if(session){await session.backfill().catch(()=>{});await startSpeakerJob({meetingId:id,captureId:session.id,location:await storage.root()})}}),onProgress:id=>organizer.preview(id),binary:runtime.captureBinary||fileURLToPath(new URL('../native/darwin-arm64/DSHMeetingAudio.app/Contents/MacOS/DSHMeetingAudio',import.meta.url))});
+ capture=new NativeCaptureManager({storage,speech,ai,models,streamDirectory,signal:organizer.controller.signal,onSaved:(id,session)=>organizer.afterCapture(id,async()=>{if(session){await session.backfill().catch(()=>{});const segments=await session.speakers?.finish().catch(()=>null);await startSpeakerJob({meetingId:id,captureId:session.id,location:await storage.root(),...(segments?{readSegments:async()=>segments}:{})})}}),onProgress:id=>organizer.preview(id),binary:runtime.captureBinary||fileURLToPath(new URL('../native/darwin-arm64/DSHMeetingAudio.app/Contents/MacOS/DSHMeetingAudio',import.meta.url))});
  const storageManagement=new StorageManagement(storage,{blocked:()=>[...(capture.starting?['*']:[]),...capture.active().map(s=>s.meetingId),...speakerJobs]});
  const reminders=new MeetingReminders({storage,capture,speech});const calendar=new SystemCalendar({storage,capture});
  const detection=new MeetingDetection({storage,capture,speech,promptBusy:()=>reminders.pending.size>0,...runtime.detection});
  capture.beforeStart=()=>detection.pauseForRecording();
  ctx.effect?.(()=>{const detector=setInterval(()=>detection.tick().catch(()=>{}),5000);detector.unref?.();const timer=setInterval(()=>{reminders.tick().catch(()=>{});calendar.tick().catch(()=>{});if(!capture.starting&&!capture.active().length)organizer.resumePending().catch(()=>{})},15000);timer.unref?.();return()=>{clearInterval(timer);clearInterval(detector);detection.dispose();reminders.dispose();calendar.dispose();minutes.dispose();organizer.dispose();return capture.dispose()}});
  const capabilities=async()=>{const localSpeech=speech.status(),model=ai.status();return {assistantAvailable:!!assistant,browserMicrophone:true,nativeStreaming:capture.streamingReady(),systemAudio:await capture.available(),transcription:await models.snapshot(),asrConfigured:localSpeech.ready,asrSource:'dsh',asrModel:localSpeech.model,localSpeech,aiConfigured:model.configured,aiModel:model.model}};
- const respondState=async state=>{await detection.loadConsent();return Response.json({...state,nativeCaptures:capture.active(),speakerJobs:[...speakerJobs],meetingDetection:detection.snapshot(state.data),capabilities:await capabilities(),serviceVersion:'0.16.18'})};
+ const respondState=async state=>{await detection.loadConsent();return Response.json({...state,nativeCaptures:capture.active(),speakerJobs:[...speakerJobs],meetingDetection:detection.snapshot(state.data),capabilities:await capabilities(),serviceVersion:'0.16.22'})};
  const route=(path,methods,handler)=>ctx.connection.fetch.register({path:PREFIX+path,methods,requestBody:'buffered',async fetch(request){try{const response=await handler(request);response.headers.set('Cache-Control','no-store');return response}catch(e){return Response.json({error:e.message||'会议服务出错'},{status:e.status||400,headers:{'Cache-Control':'no-store'}})}}});
  const body=async req=>{const raw=await req.arrayBuffer();if(raw.byteLength>MAX)throw Error('文件或数据超过 25 MB 上限');return new Uint8Array(raw)};
  route('/state',['GET','POST'],async req=>{if(req.method==='GET'){await capture.restore();return respondState(await storage.read())};const payload=JSON.parse(new TextDecoder().decode(await body(req)));const activeSessions=capture.active();if(activeSessions.length){const present=await storage.read();if(present.revision!==payload.revision){const error=Error('资料正在更新，请重试保存');error.status=409;throw error}for(const active of activeSessions){const before=present.data.meetings.find(m=>m.id===active.meetingId),after=payload.data?.meetings?.find(m=>m.id===active.meetingId);if(!after||after.captureId!==before?.captureId||JSON.stringify(after.transcript)!==JSON.stringify(before?.transcript))throw Error('请先结束双路录音，再删除会议、修改逐字稿或恢复备份')}}const saved=await storage.write(payload.data,payload.revision);reminders.reconcile(saved.data);return respondState(saved)});
@@ -93,7 +93,7 @@ export function apply(ctx,config,runtime={}){
  });
  route('/capture/permissions',['GET'],async()=>Response.json(await capture.permissions()));
  route('/capture/events',['GET'],async req=>{const q=new URL(req.url).searchParams;return Response.json(capture.get(q.get('id')).snapshot(Number(q.get('after')||0)))});
- route('/capture/control',['POST'],async req=>{const {id,action}=await req.json();return Response.json(await capture.get(id).control(action))});
+ route('/capture/control',['POST'],async req=>{const {id,action,background}=await req.json();return Response.json(await capture.get(id).control(action,{background:background===true}))});
  route('/transcribe',['POST'],async req=>{const result=await speech.transcribe(await body(req),new URL(req.url).searchParams.get('language')||'auto',req.signal);return Response.json({text:checkedTranscript(result.text),provider:'dsh',model:'SenseVoiceSmall'})});
  route('/calendar/connect',['POST'],async()=>Response.json(await calendar.connect()));
  route('/calendar/sync',['POST'],async req=>Response.json(await calendar.sync(await req.json())));

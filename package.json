@@ -1,6 +1,6 @@
 {
   "name": "dsh-meeting-workspace-local",
-  "version": "0.16.18",
+  "version": "0.16.22",
   "description": "DSH 会议纪要工作台：会议采集、逐字稿、纪要、任务与原生会话辅助",
   "type": "module",
   "license": "MIT",

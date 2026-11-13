@@ -29,6 +29,7 @@ final class MeetingContentView: NSView {
     private var visible = Set([0, 1, 2])
     private var lastQuestion = ""
     private var lastAnswerDisplay = ""
+    private var questionFailed = false
     private let paneTitles = ["逐字稿", "AI 摘要", "提问"]
     var submitQuestion: ((String) -> Void)?
     var visiblePanes: Set<Int> { visible }
@@ -212,7 +213,11 @@ final class MeetingContentView: NSView {
             answers.scrollToEndOfDocument(nil)
             if value["questionError"] as? Bool == true, question.stringValue.isEmpty { question.stringValue = lastQuestion }
         }
-        if let busy = value["questionBusy"] as? Bool { ask.isEnabled = !busy && recording }
+        if let failed = value["questionError"] as? Bool { questionFailed = failed }
+        if let busy = value["questionBusy"] as? Bool {
+            ask.isEnabled = !busy && recording
+            ask.title = busy ? "回答中…" : questionFailed ? "重试" : "发送"
+        }
         if let value = value["paused"] as? Bool {
             paused = value
             pause.title = paused ? "继续录制" : "暂停"
