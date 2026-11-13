@@ -157,6 +157,34 @@ if CommandLine.arguments.contains("--prompt-interaction-self-test") {
         emit(["type": "prompt-interaction-test", "passed": true, "selectedProject": result["project"]!, "duplicateNames": true, "longNames": true, "blockedStart": true, "snoozeNoProjectWrite": true, "recordsAudio": false])
     }; exit(0)
 }
+if CommandLine.arguments.contains("--question-ui-self-test") {
+    MainActor.assumeIsolated {
+        NSApplication.shared.setActivationPolicy(.prohibited)
+        let panel = MeetingPanel(title: "提问重试测试 · 不录音", show: false)
+        func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap { descendants($0) } }
+        if !panel.visiblePanes.contains(2) { panel.togglePane(2, persist: false) }
+        let controls = descendants(panel.panel.contentView!)
+        let button = controls.compactMap { $0 as? NSButton }.first { $0.title == "发送" }!
+        let input = controls.compactMap { $0 as? NSTextField }.first { $0.placeholderString == "询问本场会议…" }!
+        var submitted: [String] = []
+        panel.submitQuestion = { submitted.append($0) }
+        input.stringValue = "虚构会议什么时候验收？"
+        button.performClick(nil)
+        precondition(submitted.count == 1 && input.stringValue.isEmpty)
+        panel.update(["questionBusy": true, "questionError": false, "questionDisplay": "正在回答…"])
+        precondition(!button.isEnabled)
+        panel.update(["questionBusy": false, "questionError": true, "questionDisplay": "本次回答未完成，请重试。"])
+        precondition(button.isEnabled && button.title == "重试" && input.stringValue == submitted[0])
+        input.stringValue = "修改后的问题"
+        panel.update(["questionBusy": false, "questionError": true, "questionDisplay": "仍可重试"])
+        precondition(input.stringValue == "修改后的问题")
+        button.performClick(nil)
+        precondition(submitted.last == "修改后的问题")
+        panel.update(["questionBusy": false, "questionError": false, "questionDisplay": "测试回答"])
+        precondition(button.isEnabled && button.title == "发送" && !panel.panel.isVisible && !panel.bubble.panel.isVisible)
+        emit(["type": "question-ui-self-test", "passed": true, "recordsAudio": false, "showsWindows": false, "checks": ["failure-restores-question", "retry-button", "edited-draft-preserved", "success-restores-send"]])
+    }; exit(0)
+}
 if CommandLine.arguments.contains("--floating-self-test") {
     MainActor.assumeIsolated {
         let app = NSApplication.shared; app.setActivationPolicy(.accessory)
@@ -201,8 +229,48 @@ if let command = CommandLine.arguments.first(where: { ["--calendar-status", "--c
     }; exit(0)
 }
 if CommandLine.arguments.contains("--permissions") { emit(permissions()); exit(0) }
+if CommandLine.arguments.contains("--microphone-route-check") { MicrophoneInput.routeCheck(); exit(0) }
 if CommandLine.arguments.contains("--version") { emit(["version": "0.16.0"]); exit(0) }
 if CommandLine.arguments.contains("--microphone-recovery-self-test") { microphoneRecoverySelfTest(); exit(0) }
+if let index = CommandLine.arguments.firstIndex(of: "--capture-runtime-check"), CommandLine.arguments.count > index + 1 {
+    MainActor.assumeIsolated {
+        let allowed = permissions()
+        guard allowed["system"] as? Bool == true, allowed["microphone"] as? Bool == true else {
+            emit(["type":"capture-runtime-check", "passed":false, "message":"当前诊断进程未获采集权限，未启动录音"]); exit(2)
+        }
+        let app = NSApplication.shared; app.setActivationPolicy(.prohibited)
+        let capture = CapturePipeline(root: URL(fileURLWithPath: CommandLine.arguments[index + 1], isDirectory: true))
+        Task { @MainActor in
+            do {
+                try await capture.start()
+                try await Task.sleep(nanoseconds: 2_500_000_000)
+                await capture.stop()
+                let stats = capture.queue.sync { (capture.written, capture.frames["microphone"] ?? 0, capture.frames["system"] ?? 0, capture.failure) }
+                emit(["type":"capture-runtime-check", "passed":stats.0 > 16000 && stats.1 > 0 && stats.3 == nil, "microphoneFrames":stats.1, "systemFrames":stats.2, "seconds":Double(stats.0)/16000, "visibleWindows":false])
+                exit(stats.0 > 16000 && stats.1 > 0 && stats.3 == nil ? 0 : 1)
+            } catch { await capture.stop(); emit(["type":"capture-runtime-check", "passed":false, "message":error.localizedDescription]); exit(1) }
+        }
+        app.run()
+    }; exit(0)
+}
+if CommandLine.arguments.contains("--capture-ack-self-test") {
+    Task {
+        do {
+            let early = CaptureAcknowledgement(); early.complete()
+            try await early.wait(seconds: 0.1, message: "unexpected timeout")
+            let dataFirst = CaptureAcknowledgement()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.01) { dataFirst.complete(); dataFirst.complete(audioError("late completion")) }
+            try await dataFirst.wait(seconds: 0.1, message: "unexpected timeout")
+            let missing = CaptureAcknowledgement(); var timedOut = false
+            do { try await missing.wait(seconds: 0.02, message: "bounded timeout") } catch { timedOut = true }
+            precondition(timedOut)
+            missing.complete() // A late framework callback cannot resume twice.
+            emit(["type":"capture-ack-self-test", "passed":true, "recordsAudio":false, "checks":["early-callback", "first-buffer-readiness", "bounded-missing-callback", "late-callback-idempotent"]])
+            exit(0)
+        } catch { emit(["type":"capture-ack-self-test", "passed":false]); exit(1) }
+    }
+    dispatchMain()
+}
 if CommandLine.arguments.contains("--self-test") { selfTest(); exit(0) }
 MainActor.assumeIsolated {
  let app = NSApplication.shared

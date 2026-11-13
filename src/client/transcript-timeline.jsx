@@ -32,7 +32,7 @@ export function TranscriptRows({rows,query='',activeId,onAnchor}){
    return <article key={row.id} ref={onAnchor?el=>onAnchor(row.id,el):undefined} className={activeId===row.id?'highlight':''}>
     <span className="mw-transcript-avatar" data-tone={speaker.tone} aria-hidden="true">{speaker.avatar}</span>
     <div>
-     <header><strong>{speaker.label}</strong><span title={row.time}>{displayTime(row.time)}</span></header>
+     <header><strong>{speaker.label}</strong>{row.speakerAutomatic==='live'&&<span>暂定</span>}<span title={row.time}>{displayTime(row.time)}</span></header>
      <p>{highlightText(row.text,query)}</p>
     </div>
    </article>;

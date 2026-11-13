@@ -19,6 +19,8 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     var configurationObserver: NSObjectProtocol?
     var microphoneGeneration = 0
     var microphoneHealth = MicrophoneRecovery()
+    var microphoneDevice = "", microphoneFallback = false, microphoneAuthorized = true
+    var systemStartup: CaptureAcknowledgement?
     var stream: SCStream?
     var files: [String: AVAudioFile] = [:]
     var mixer: AudioTimeline!
@@ -43,12 +45,16 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     }
     @MainActor func start() async throws {
         guard !active, !stopping else { throw audioError("录音已经开始") }
+        emit(["type":"stage", "message":"正在检查电脑声音采集权限…"])
         guard microphoneOnly || CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess() else { throw audioError("电脑声音未授权。请在系统设置 → 隐私与安全性 → 屏幕录制中允许“DSH 会议音频”，再重新开始记录。") }
         if !systemOnly {
+            emit(["type":"stage", "message":"正在检查麦克风权限…"])
             let allowed = await AVCaptureDevice.requestAccess(for: .audio)
+            guard !stopping else { throw audioError("录音启动已取消") }
             guard allowed else { throw audioError("麦克风未授权。请在系统设置 → 隐私与安全性 → 麦克风中允许“DSH 会议音频”。") }
         }
         if !microphoneOnly {
+        emit(["type":"stage", "message":"正在连接系统声音采集…"])
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else { throw audioError("没有可用的显示器，无法采集电脑声音") }
         let config = SCStreamConfiguration()
@@ -65,8 +71,17 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         files["mixed"] = try makeFile("mixed")
         // ScreenCaptureKit can change the audio hardware configuration during startup.
         // Start it first, then construct the microphone engine against the settled route.
-        try await stream?.startCapture()
+        if let stream = stream {
+            let ready = CaptureAcknowledgement()
+            queue.sync { systemStartup = ready }
+            emit(["type":"stage", "message":"正在启动电脑声音采集…"])
+            stream.startCapture(completionHandler: { ready.complete($0) })
+            try await ready.wait(seconds: 8, message: "电脑声音采集启动没有响应，请重试；也可选择仅麦克风录音")
+            queue.sync { systemStartup = nil }
+        }
+        guard !stopping else { throw audioError("录音启动已取消") }
         if !systemOnly {
+            emit(["type":"stage", "message":"正在启动麦克风采集…"])
             queue.sync { microphoneHealth.start(at: now) }
             do { try rebuildMicrophone() }
             catch { queue.sync { microphoneHealth.configurationChanged(at: now) } }
@@ -84,13 +99,16 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             clock.resume(); timer = clock; emit(["type": "started", "system": !microphoneOnly, "microphone": !systemOnly]); status()
         }
     }
-    @MainActor func rebuildMicrophone() throws {
+    @MainActor func rebuildMicrophone(preferBuiltIn: Bool = false) throws {
         // Do not hold the audio queue while removing a tap: its callback synchronizes there.
         queue.sync { microphoneGeneration += 1; mixer.converters.removeValue(forKey: "microphone") }
         if let observer = configurationObserver { NotificationCenter.default.removeObserver(observer); configurationObserver = nil }
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }
         engine?.stop()
         let replacement = AVAudioEngine(); engine = replacement
+        emit(["type":"capture-diagnostic", "phase":"microphone-route"])
+        let route = try MicrophoneInput.configure(replacement, preferBuiltIn: preferBuiltIn)
+        queue.sync { microphoneDevice = route.name; microphoneFallback = route.fallback }
         let generation = queue.sync { microphoneGeneration }
         configurationObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange, object: replacement, queue: nil) { [weak self] _ in
             // Apple's callback runs on an internal queue. Defer teardown to MainActor.
@@ -99,29 +117,37 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.microphoneHealth.configurationChanged(at: self.now)
             }
         }
+        emit(["type":"capture-diagnostic", "phase":"microphone-format"])
         let input = replacement.inputNode, format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw audioError("麦克风输入暂不可用") }
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, when in
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, when in
             guard let self = self else { return }
             self.queue.sync {
                 guard generation == self.microphoneGeneration else { return }
-                self.consume(buffer, source: "microphone", timestamp: when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : self.now - Double(buffer.frameLength) / format.sampleRate)
+                self.consume(buffer, source: "microphone", timestamp: when.isHostTimeValid ? AVAudioTime.seconds(forHostTime: when.hostTime) : self.now - Double(buffer.frameLength) / buffer.format.sampleRate)
             }
         }
-        tapInstalled = true; replacement.prepare(); try replacement.start()
+        tapInstalled = true
+        emit(["type":"capture-diagnostic", "phase":"microphone-prepare"])
+        replacement.prepare()
+        emit(["type":"capture-diagnostic", "phase":"microphone-start"])
+        try replacement.start()
+        emit(["type":"capture-diagnostic", "phase":"microphone-running"])
     }
     @MainActor func checkMicrophone() {
         let action = queue.sync { () -> MicrophoneRecovery.Action in
             guard active, !stopping, failure == nil else { return .none }
+            microphoneAuthorized = AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
             let action = microphoneHealth.tick(at: now, running: engine?.isRunning == true,
-                authorized: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
+                authorized: microphoneAuthorized, keepSystemAudio: !microphoneOnly)
             if action == .restart || action == .recovered { status() }
             return action
         }
         switch action {
         case .restart:
             // No await between the state check and rebuild, so pause/stop cannot interleave.
-            do { try rebuildMicrophone() } catch { /* Next bounded attempt retries the current route. */ }
+            let preferBuiltIn = queue.sync { microphoneHealth.totalAttempts >= 2 }
+            do { try rebuildMicrophone(preferBuiltIn: preferBuiltIn) } catch { /* Keep system capture alive; the watchdog retries. */ }
         case .failed:
             queue.sync { fail(AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
                 ? "麦克风重连失败，录音已停止并保留已采集内容。请检查输入设备后重新开始。"
@@ -140,7 +166,14 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
             levels[source] = sqrt(energy / Float(data.count)); frames[source, default: 0] += data.count; last[source] = now
             let time = timestamp.isFinite && abs(timestamp - now) < 30 ? timestamp : now - Double(data.count) / 16000
             mixer.append(data, at: time)
-        } catch { fail("\(source == "system" ? "电脑声音" : "麦克风")保存失败：\(error.localizedDescription)") }
+        } catch {
+            if source == "microphone" {
+                // Format conversion can fail while Bluetooth renegotiates its route.
+                // No file write takes place here: discard this buffer and reconnect.
+                levels["microphone"] = 0
+                microphoneHealth.configurationChanged(at: now)
+            } else { fail("电脑声音格式转换失败：\(error.localizedDescription)") }
+        }
     }
     func writeMixed(_ samples: [Float]) {
         do {
@@ -168,19 +201,25 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
     func status() {
         let mic: Float = paused || now - (last["microphone"] ?? 0) > 1 ? 0 : levels["microphone"] ?? 0
         let sys: Float = paused || now - (last["system"] ?? 0) > 1 ? 0 : levels["system"] ?? 0
-        let value: [String: Any] = ["type": "status", "seconds": Double(written) / 16000, "paused": paused, "microphoneLevel": mic, "systemLevel": sys, "microphoneFrames": frames["microphone"] ?? 0, "systemFrames": frames["system"] ?? 0, "droppedSamples": mixer.droppedSamples, "microphoneRecovering": microphoneHealth.recovering, "microphoneRecoveries": microphoneHealth.recoveries, "microphoneInterruptions": microphoneHealth.interruptions, "microphoneGapSeconds": microphoneHealth.gapSeconds, "microphoneRestartAttempts": microphoneHealth.totalAttempts]
-        emit(value); var display = value
-        if microphoneHealth.recovering && !paused { display["status"] = microphoneOnly ? "麦克风连接中，暂未采集到声音…" : "麦克风重连中，电脑声音继续保存…" }
-        else if microphoneHealth.recoveries > 0 { display["status"] = "麦克风已恢复，连接中断期间可能缺少麦克风声音" }
-        statusChanged?(display)
+        var value: [String: Any] = ["type": "status", "seconds": Double(written) / 16000, "paused": paused, "microphoneLevel": mic, "systemLevel": sys, "microphoneFrames": frames["microphone"] ?? 0, "systemFrames": frames["system"] ?? 0, "droppedSamples": mixer.droppedSamples, "microphoneRecovering": microphoneHealth.recovering, "microphoneRecoveries": microphoneHealth.recoveries, "microphoneInterruptions": microphoneHealth.interruptions, "microphoneGapSeconds": microphoneHealth.gapSeconds, "microphoneRestartAttempts": microphoneHealth.totalAttempts, "microphoneDevice": microphoneDevice, "microphoneFallback": microphoneFallback, "microphoneAuthorized": microphoneAuthorized]
+        value["microphoneStatus"] = ""
+        if !microphoneAuthorized && !paused { value["microphoneStatus"] = "麦克风权限已关闭，电脑声音继续保存；请恢复麦克风权限" }
+        else if microphoneHealth.recovering && !paused { value["microphoneStatus"] = microphoneOnly ? "麦克风连接中，暂未采集到声音…" : "麦克风重连中，电脑声音继续保存；暂未采集麦克风声音…" }
+        else if microphoneFallback && microphoneHealth.recoveries > 0 { value["microphoneStatus"] = "已改用 Mac 内置麦克风；中断期间可能缺少麦克风声音" }
+        else if microphoneHealth.recoveries > 0 { value["microphoneStatus"] = "麦克风已恢复，连接中断期间可能缺少麦克风声音" }
+        value["status"] = value["microphoneStatus"] ?? ""
+        emit(value); statusChanged?(value)
     }
     @MainActor func setPaused(_ value: Bool) {
-        queue.sync { guard active, !stopping else { return }; if value { microphoneHealth.pause(); mixer.pause(now: now); flushSegment(); if streamPCM { emit(["type":"stream-boundary"]) } } else { microphoneHealth.resume(at: now); mixer.resume(now: now) }; paused = value; status() }
+        queue.sync { guard active, !stopping else { return }; if value { microphoneHealth.pause(at: now); mixer.pause(now: now); flushSegment(); if streamPCM { emit(["type":"stream-boundary"]) } } else { microphoneHealth.resume(at: now); mixer.resume(now: now) }; paused = value; status() }
     }
     func fail(_ message: String) {
         guard failure == nil else { return }; failure = message; emit(["type": "error", "message": message]); Task { @MainActor in await self.stop() }
     }
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        if (type == .audio || type == .screen), CMSampleBufferDataIsReady(sampleBuffer), let ready = systemStartup {
+            systemStartup = nil; ready.complete()
+        }
         guard type == .audio, active, !paused, !stopping, CMSampleBufferDataIsReady(sampleBuffer), let desc = CMSampleBufferGetFormatDescription(sampleBuffer), let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc), let format = AVAudioFormat(streamDescription: asbd) else { return }
         let count = CMSampleBufferGetNumSamples(sampleBuffer)
         guard count > 0, let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) else { return }
@@ -188,18 +227,24 @@ final class CapturePipeline: NSObject, SCStreamOutput, SCStreamDelegate {
         guard CMSampleBufferCopyPCMDataIntoAudioBufferList(sampleBuffer, at: 0, frameCount: Int32(count), into: buffer.mutableAudioBufferList) == noErr else { fail("电脑声音采样解码失败"); return }
         consume(buffer, source: "system", timestamp: CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)))
     }
-    func stream(_ stream: SCStream, didStopWithError error: Error) { queue.async { self.fail("电脑声音采集已中断：" + error.localizedDescription) } }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { queue.async { if !self.stopping { self.systemStartup?.complete(error); self.fail("电脑声音采集已中断：" + error.localizedDescription) } } }
     @MainActor func stop() async {
-        let shouldStop = queue.sync { () -> Bool in if stopping { return false }; stopping = true; microphoneHealth.stop(); microphoneGeneration += 1; return true }
+        let shouldStop = queue.sync { () -> Bool in if stopping { return false }; stopping = true; systemStartup?.complete(audioError("录音启动已取消")); systemStartup = nil; microphoneHealth.stop(at: now); microphoneGeneration += 1; return true }
         guard shouldStop else { return }
         if let observer = configurationObserver { NotificationCenter.default.removeObserver(observer); configurationObserver = nil }
         if tapInstalled { engine?.inputNode.removeTap(onBus: 0); tapInstalled = false }; engine?.stop()
-        try? await stream?.stopCapture()
+        if let stream = stream {
+            let stopped = CaptureAcknowledgement()
+            stream.stopCapture(completionHandler: { stopped.complete($0) })
+            // Ignore a missing stop callback after a bounded wait, then flush the
+            // mixed file; late buffers are already rejected by stopping == true.
+            try? await stopped.wait(seconds: 4, message: "系统采集结束通知超时")
+        }
         queue.sync {
             timer?.cancel(); timer = nil
             if active { mixer.finish(now: now); flushSegment() }
             active = false; files.removeAll()
-            let result: [String: Any] = ["type": "stopped", "seconds": Double(written) / 16000, "failed": failure != nil, "microphoneFrames": frames["microphone"] ?? 0, "systemFrames": frames["system"] ?? 0, "microphoneRecoveries": microphoneHealth.recoveries, "microphoneInterruptions": microphoneHealth.interruptions, "microphoneGapSeconds": microphoneHealth.gapSeconds, "microphoneRestartAttempts": microphoneHealth.totalAttempts]
+            let result: [String: Any] = ["type": "stopped", "seconds": Double(written) / 16000, "failed": failure != nil, "microphoneFrames": frames["microphone"] ?? 0, "systemFrames": frames["system"] ?? 0, "microphoneRecoveries": microphoneHealth.recoveries, "microphoneInterruptions": microphoneHealth.interruptions, "microphoneGapSeconds": microphoneHealth.gapSeconds, "microphoneRestartAttempts": microphoneHealth.totalAttempts, "microphoneDevice": microphoneDevice, "microphoneFallback": microphoneFallback, "microphoneAuthorized": microphoneAuthorized]
             if let data = try? JSONSerialization.data(withJSONObject: result) { try? data.write(to: root.appendingPathComponent("completed.json"), options: .atomic) }
             emit(result)
         }

@@ -20,4 +20,9 @@ const app='native/darwin-arm64/DSHMeetingAudio.app';const binary=app+'/Contents/
 
 if(process.platform==='darwin'&&process.arch==='arm64'){const activity=JSON.parse(execFileSync('./'+binary,['--activity-self-test'],{encoding:'utf8'}));assert(activity.passed&&activity.recordsAudio===false);console.log('PASS: supported meeting app identities, helper matching, ignore own recorder and browsers')}
 
-if(process.platform==='darwin'&&process.arch==='arm64'){const r=JSON.parse(execFileSync('./'+binary,['--microphone-recovery-self-test'],{encoding:'utf8'}));assert(r.passed&&r.recordsAudio===false);console.log('PASS: microphone startup grace, route recovery, real samples, bounded retries, stop/pause and permission loss')}
+if(process.platform==='darwin'&&process.arch==='arm64'){const r=JSON.parse(execFileSync('./'+binary,['--microphone-recovery-self-test'],{encoding:'utf8'}));assert(r.passed&&r.recordsAudio===false);for(const check of ['system-audio-survives-90-second-mic-outage','retry-backoff','permission-restored','builtin-input-fallback'])assert(r.checks.includes(check));console.log('PASS: microphone recovery, sustained system capture, backoff, permission restoration and built-in input fallback')}
+
+for(const file of ['speaker-worker.cjs','speaker-core.cjs']){const source=await readFile('dsh/'+file,'utf8');new vm.Script(source,{filename:file});assert(source.length>100)}
+console.log('PASS: isolated speaker worker and matching logic are packaged with the plugin');
+
+if(process.platform==='darwin'&&process.arch==='arm64'){const r=JSON.parse(execFileSync('./'+binary,['--capture-ack-self-test'],{encoding:'utf8'}));assert(r.passed&&r.recordsAudio===false);console.log('PASS: capture acknowledgement, first-buffer readiness and bounded missing callbacks')}

@@ -1,7 +1,8 @@
 import {MAX_TEXT,parseTranscript} from './model.mjs';
 
 export function needsSpeakerAnalysis(meeting){
- return Boolean(meeting?.captureId&&meeting.audio.length&&!meeting.speakerAutoAttempted&&!meeting.speakerTranscript?.length
+ const retryOldLimit=meeting?.duration<=7200&&meeting.speakerAnalysisVersion!==2&&/30 分钟/.test(meeting.speakerStatus||'');
+ return Boolean(meeting?.captureId&&meeting.audio.length&&(!meeting.speakerAutoAttempted||retryOldLimit)&&!meeting.speakerTranscript?.length
   &&!['录制中','录音中','准备录音','暂停中'].includes(meeting.status)
   &&meeting.transcript.some(row=>row.speaker==='发言人')
   &&!meeting.transcript.some(row=>/^发言人 \d+$/.test(row.speaker)));
